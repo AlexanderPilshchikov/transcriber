@@ -25,9 +25,21 @@ Single-file pipeline in `transcribe_diarize.py`. Per-file processing has 4 stage
 ## Key configuration
 
 ```python
-MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"  # fallback when no Groq key
-GROQ_MODEL     = "whisper-large-v3-turbo"                 # Groq model name
+MLX_MODEL_REPO      = "mlx-community/whisper-large-v3-turbo"  # fallback when no Groq key
+GROQ_MODEL          = "whisper-large-v3-turbo"                 # Groq model name
+GROQ_MAX_FILE_BYTES = 24 * 1024 * 1024  # Groq upload limit is 25 MB; 24 MB with margin
+GROQ_CHUNK_SEC      = 600               # chunk length when splitting (10 min)
 ```
+
+## Large-file chunking (Groq)
+
+`run_whisper()` checks the WAV size before uploading. If it exceeds `GROQ_MAX_FILE_BYTES`:
+
+1. `split_audio()` calls `ffmpeg -f segment` to cut the WAV into `GROQ_CHUNK_SEC`-second chunks stored in `temp/`.
+2. `_transcribe_chunk()` uploads each chunk and shifts every segment's `start`/`end` by `i * GROQ_CHUNK_SEC`.
+3. Chunk files are deleted immediately after transcription.
+
+WAV 16 kHz mono is ~1.8 MB/min, so files longer than ~13 min trigger chunking.
 
 ## Backend selection (runtime)
 

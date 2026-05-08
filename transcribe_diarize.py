@@ -27,6 +27,10 @@ from pyannote.audio.pipelines.utils.hook import ProgressHook
 MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 # Модель Groq Whisper (основной бэкенд)
 GROQ_MODEL = "whisper-large-v3-turbo"
+# Groq ограничение: 25 МБ. Берём 24 МБ с запасом.
+GROQ_MAX_FILE_BYTES = 24 * 1024 * 1024
+# Длина чанка при разбивке большого файла (10 минут)
+GROQ_CHUNK_SEC = 600
 
 # Папки проекта (создаются автоматически рядом со скриптом)
 INPUT_DIR_NAME = "input"
@@ -156,10 +160,62 @@ def get_groq_key(base_dir: Path):
 
 # ------------ Whisper и диаризация ------------
 
+def split_audio(audio_path: Path, chunk_sec: int) -> list[Path]:
+    """Разбивает WAV на чанки по chunk_sec секунд через ffmpeg segment muxer."""
+    temp_dir = audio_path.parent
+    chunk_pattern = temp_dir / f"{audio_path.stem}_chunk%03d.wav"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-f", "segment",
+        "-segment_time", str(chunk_sec),
+        "-c", "copy",
+        str(chunk_pattern),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return sorted(temp_dir.glob(f"{audio_path.stem}_chunk*.wav"))
+
+
+def _transcribe_chunk(client, chunk_path: Path, offset: float) -> list[dict]:
+    """Транскрибирует один чанк через Groq API, возвращает сегменты с поправкой на offset."""
+    with open(chunk_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model=GROQ_MODEL,
+            file=(chunk_path.name, f),
+            response_format="verbose_json",
+        )
+    return [
+        {"start": s["start"] + offset, "end": s["end"] + offset, "text": s["text"]}
+        for s in result.segments
+    ]
+
+
 def run_whisper(audio_path: Path, groq_key: str | None = None):
     if groq_key:
-        print(f"[whisper] Транскрибирую {audio_path.name} (Groq API) ...")
+        file_size = audio_path.stat().st_size
         client = Groq(api_key=groq_key)
+
+        if file_size > GROQ_MAX_FILE_BYTES:
+            size_mb = file_size / 1024 / 1024
+            print(
+                f"[whisper] Файл {audio_path.name} ({size_mb:.0f} МБ) превышает "
+                f"лимит Groq 25 МБ, разбиваю на чанки по {GROQ_CHUNK_SEC // 60} мин ..."
+            )
+            chunks = split_audio(audio_path, GROQ_CHUNK_SEC)
+            print(f"[whisper] Чанков: {len(chunks)}")
+            all_segments = []
+            for i, chunk_path in enumerate(chunks):
+                offset = i * GROQ_CHUNK_SEC
+                print(
+                    f"[whisper] Чанк {i + 1}/{len(chunks)}: {chunk_path.name} "
+                    f"(смещение {format_time(offset)}) ..."
+                )
+                all_segments.extend(_transcribe_chunk(client, chunk_path, float(offset)))
+                chunk_path.unlink()
+            print(f"[whisper] Готово: {audio_path.name} ({len(all_segments)} сегментов)")
+            return {"segments": all_segments}
+
+        print(f"[whisper] Транскрибирую {audio_path.name} (Groq API) ...")
         with open(audio_path, "rb") as f:
             result = client.audio.transcriptions.create(
                 model=GROQ_MODEL,

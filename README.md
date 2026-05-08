@@ -84,9 +84,15 @@ python transcribe_diarize.py
 В начале `transcribe_diarize.py`:
 
 ```python
-MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"  # fallback-модель
-GROQ_MODEL     = "whisper-large-v3-turbo"                 # Groq-модель
+MLX_MODEL_REPO     = "mlx-community/whisper-large-v3-turbo"  # fallback-модель
+GROQ_MODEL         = "whisper-large-v3-turbo"                 # Groq-модель
+GROQ_MAX_FILE_BYTES = 24 * 1024 * 1024  # порог разбивки на чанки (24 МБ)
+GROQ_CHUNK_SEC     = 600                # длина чанка в секундах (10 мин)
 ```
+
+### Большие файлы
+
+Groq API ограничивает загружаемый файл 25 МБ. WAV 16kHz mono весит ~1.8 МБ/мин, поэтому файлы длиннее ~13 минут автоматически разбиваются на чанки по 10 минут. Чанки транскрибируются последовательно, таймкоды корректируются, временные файлы удаляются после каждого чанка.
 
 ## Структура проекта
 

@@ -1,25 +1,34 @@
 # transcriber
 
-Пайплайн автоматической транскрипции и диаризации аудио/видео файлов.
+Пайплайн автоматической транскрипции и диаризации аудио/видео файлов для Apple Silicon.
 
-Скрипт берёт файлы из папки `input/`, транскрибирует их через **faster-whisper** (`large-v3-turbo`), определяет спикеров через **pyannote.audio** и сохраняет результат в `output/` в виде Markdown с таймкодами.
+Кладёт файлы в `input/`, запускает скрипт — получает Markdown с таймкодами и именами спикеров в `output/`.
+
+## Скорость
+
+| | Время | RTF |
+|---|---|---|
+| Предыдущий (mlx-whisper + pyannote, CPU) | 10:13 | 2.7× медленнее |
+| **Текущий (Groq API + simple-diarizer)** | **0:36** | **6.4× быстрее** реального времени |
+
+Тест: файл 3:49, Apple M2.
 
 ## Как работает
 
-1. Сканирует папку `input/` на наличие аудио/видео файлов
-2. Любой входной файл конвертирует в WAV 16 kHz mono через `ffmpeg` (и аудио, и видео)
-3. Транскрибирует аудио — faster-whisper возвращает сегменты с таймкодами
-4. Диаризирует — pyannote определяет, кто и когда говорил
-5. Совмещает транскрипцию с диаризацией по временным интервалам
-6. Сохраняет `output/<имя_файла>.md` с разметкой по спикерам
+1. Любой входной файл конвертируется в WAV 16 kHz mono через `ffmpeg`
+2. Параллельно запускаются два процесса:
+   - **Транскрипция** — Groq Whisper API (сетевой запрос, ~секунды); fallback: mlx-whisper на GPU/Neural Engine
+   - **Диаризация** — simple-diarizer ECAPA-TDNN (CPU); fallback: pyannote.audio
+3. Сегменты Whisper совмещаются с метками спикеров по таймкодам
+4. Сохраняется `output/<имя>.md`
 
 ## Пример вывода
 
 ```markdown
 # Транскрипция: meeting.mp4
 
-- Модель ASR: Whisper `turbo`
-- Диаризация: `pyannote/speaker-diarization-3.1`
+- Модель ASR: Whisper `groq/whisper-large-v3-turbo`
+- Диаризация: `simple-diarizer/ecapa`
 
 **Спикер 1 [00:00:03–00:00:10]:** Добрый день, начнём совещание.
 
@@ -28,60 +37,40 @@
 
 ## Требования
 
-- Python 3.9+
+- Python 3.10+
 - `ffmpeg` (должен быть доступен в `PATH`)
-- Токен [Hugging Face](https://huggingface.co/settings/tokens) с принятыми условиями моделей:
-  - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-  - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+- **Groq API ключ** (бесплатно, 2 ч/день): [console.groq.com](https://console.groq.com) → API Keys
 
-### Python-зависимости
-
-| Пакет | Версия |
-|---|---|
-| faster-whisper | — |
-| pyannote.audio | 4.0.4 |
-| torch | 2.11.0 |
+HuggingFace токен нужен только если Groq недоступен и используется fallback-диаризация через pyannote.
 
 ## Установка
 
 ```bash
-# Клонировать / скачать репозиторий
-cd transcriber
-
-# Создать виртуальное окружение
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
-# Установить зависимости
-pip install faster-whisper pyannote.audio torch
+pip install groq simple-diarizer mlx-whisper pyannote.audio torch
 ```
 
-## Токен Hugging Face
-
-Создать файл `hf_token.txt` в корне проекта и вставить туда токен одной строкой:
-
-```
-hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-Либо экспортировать переменную окружения:
+## Ключ Groq
 
 ```bash
-export HUGGINGFACE_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+echo "gsk_xxxxxxxxxx" > groq_key.txt
 ```
+
+Либо через переменную окружения: `export GROQ_API_KEY=gsk_xxxxxxxxxx`
+
+Без ключа скрипт автоматически переключается на mlx-whisper (Metal GPU/Neural Engine).
 
 ## Использование
 
 ```bash
-# Положить файлы в input/
 cp /path/to/meeting.mp4 input/
-
-# Запустить
 source .venv/bin/activate
 python transcribe_diarize.py
 ```
 
-Готовые транскрипты появятся в `output/`. Файлы, для которых транскрипт уже существует, повторно не обрабатываются.
+Файлы, для которых транскрипт уже существует в `output/`, пропускаются.
 
 ## Поддерживаемые форматы
 
@@ -92,33 +81,21 @@ python transcribe_diarize.py
 
 ## Конфигурация
 
-В начале файла `transcribe_diarize.py` можно изменить:
+В начале `transcribe_diarize.py`:
 
 ```python
-MODEL_NAME = "turbo"   # tiny / base / small / medium / large / large-v3-turbo
+MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"  # fallback-модель
+GROQ_MODEL     = "whisper-large-v3-turbo"                 # Groq-модель
 ```
-
-Фактически используется `large-v3-turbo` с `int8`-квантизацией на CPU — на Apple Silicon M1/M2/M3 работает в 2–4 раза быстрее старого `openai-whisper`.
-
-## Железо
-
-Скрипт автоматически выбирает устройство:
-
-| Устройство | Условие |
-|---|---|
-| CUDA | NVIDIA GPU |
-| MPS | Apple Silicon (M1/M2/M3) |
-| CPU | fallback |
-
-> **Примечание:** faster-whisper и pyannote работают на CPU (MPS не поддерживается). На Apple Silicon всё выполняется на CPU с `int8`-квантизацией — это всё равно существенно быстрее старого `openai-whisper`.
 
 ## Структура проекта
 
 ```
 transcriber/
 ├── transcribe_diarize.py   # основной скрипт
-├── hf_token.txt            # токен HuggingFace (не коммитить!)
+├── groq_key.txt            # ключ Groq API (не коммитить!)
+├── hf_token.txt            # токен HuggingFace, нужен только для pyannote fallback
 ├── input/                  # входные файлы
 ├── output/                 # готовые транскрипты (.md)
-└── temp/                   # временные WAV-файлы (создаются для каждого входного файла)
+└── temp/                   # временные WAV-файлы (удаляются автоматически)
 ```

@@ -15,36 +15,43 @@ Place audio/video files in `input/` before running. Existing transcripts in `out
 
 Single-file pipeline in `transcribe_diarize.py`. Per-file processing has 4 stages:
 
-1. **Audio prep** (`convert_to_mono16k_wav`) — every input file (audio or video) is converted to mono 16 kHz WAV in `temp/` via `ffmpeg`. The temp file is always deleted after processing.
-2. **faster-whisper** (`run_whisper`) — uses `WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")`. The generator returned by `model.transcribe()` is eagerly consumed into a list of `{"start", "end", "text"}` dicts to match the rest of the pipeline.
-3. **pyannote** (`run_pyannote`) — returns diarization segments with `start`, `end`, `speaker`. Handles both old API (returns `Annotation` directly) and new API (returns `DiarizeOutput` with `.speaker_diarization`).
-4. **Merge + output** (`assign_speakers_to_segments` → `normalize_speaker_labels` → `build_markdown`) — assigns a speaker to each Whisper segment by midpoint lookup, falls back to max-overlap; maps internal labels (`SPEAKER_00`, etc.) to "Спикер 1", "Спикер 2", …; writes Markdown to `output/`.
+1. **Audio prep** (`convert_to_mono16k_wav`) — every input file (audio or video) is converted to mono 16 kHz WAV in `temp/` via `ffmpeg`. Temp file is deleted after processing.
+2. **Transcription + Diarization in parallel** (`ThreadPoolExecutor(max_workers=2)`):
+   - `run_whisper(audio_path, groq_key)` — if `groq_key` is set, calls Groq Whisper API (network I/O, ~seconds); otherwise falls back to `mlx_whisper.transcribe()` on Metal GPU/Neural Engine. Returns `{"segments": [{"start", "end", "text"}]}`.
+   - `run_diarization(audio_path, diar_pipeline)` — tries `run_simple_diarizer()` first (ECAPA-TDNN via speechbrain, CPU); falls back to `run_pyannote()` on `ImportError`.
+3. **Merge** (`assign_speakers_to_segments` → `normalize_speaker_labels`) — assigns speaker to each Whisper segment by midpoint lookup, falls back to max-overlap. Maps internal labels to "Спикер 1", "Спикер 2", …
+4. **Output** (`build_markdown`) — writes `output/<stem>.md`.
 
 ## Key configuration
 
-At the top of `transcribe_diarize.py`:
-
 ```python
-MODEL_NAME = "turbo"   # used only in Markdown output header
-OMP_NUM_THREADS = 8    # also sets torch.set_num_threads(8)
+MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"  # fallback when no Groq key
+GROQ_MODEL     = "whisper-large-v3-turbo"                 # Groq model name
 ```
 
-The actual faster-whisper model (`large-v3-turbo`) and compute settings (`device="cpu"`, `compute_type="int8"`) are hardcoded in `main()`. pyannote model is hardcoded: `pyannote/speaker-diarization-3.1`.
+## Backend selection (runtime)
 
-## Device selection
+`main()` auto-selects backends:
 
-`detect_device()` returns `cuda` → `mps` → `cpu`. Both faster-whisper and pyannote run on CPU (faster-whisper does not support MPS; pyannote is also forced to CPU when MPS is detected). On Apple Silicon, `int8` quantization on CPU is still 2–4× faster than old `openai-whisper`.
+| Backend | Condition |
+|---|---|
+| Groq API (transcription) | `groq_key.txt` exists or `GROQ_API_KEY` env var set |
+| mlx-whisper fallback | No Groq key found |
+| simple-diarizer (diarization) | `simple_diarizer` importable |
+| pyannote fallback | `ImportError` on simple_diarizer import |
 
-## HuggingFace token
+pyannote requires HuggingFace token (`hf_token.txt` or `HUGGINGFACE_TOKEN` env var). simple-diarizer does not.
 
-`get_hf_token()` checks `HUGGINGFACE_TOKEN` env var first, then `hf_token.txt` in the project root. The token must have access to `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`.
+## silero-vad trust
+
+`run_simple_diarizer()` pre-adds `snakers4_silero-vad` to `~/.cache/torch/hub/trusted_list` before loading the Diarizer to avoid an interactive stdin prompt when running without a terminal.
 
 ## Dependencies
 
 Managed in `.venv/`. No `requirements.txt` — install manually:
 
 ```bash
-pip install faster-whisper pyannote.audio torch
+pip install groq simple-diarizer mlx-whisper pyannote.audio torch
 ```
 
 `ffmpeg` must be available in `PATH`.

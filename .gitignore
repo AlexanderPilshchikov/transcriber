@@ -1,5 +1,6 @@
 .venv/
 hf_token.txt
+groq_key.txt
 input/
 output/
 temp/

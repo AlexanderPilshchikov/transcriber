@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-Пайплайн:
-- Берём все аудио/видео из папки input/
-- Для видео вытаскиваем аудио через ffmpeg
-- Whisper -> транскрипция с сегментами
-- pyannote.audio -> диаризация
-- Мерджим по таймкодам, сохраняем Markdown в output/
+Пайплайн транскрипции и диаризации аудио/видео:
+- ffmpeg  → WAV 16 kHz mono
+- Whisper → транскрипция (Groq API или mlx-whisper как fallback)
+- simple-diarizer → диаризация (pyannote как fallback)
+- Мёрдж по таймкодам → Markdown в output/
+
+Транскрипция и диаризация запускаются параллельно через ThreadPoolExecutor.
 """
 
+import concurrent.futures
 import os
 import subprocess
 from pathlib import Path
 
+import mlx_whisper
 import torch
-from faster_whisper import WhisperModel
+from groq import Groq
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 
 # ------------ Конфигурация ------------
 
-os.environ["OMP_NUM_THREADS"] = "8"
-torch.set_num_threads(8)
-
-# Модель Whisper: tiny/base/small/medium/large
-MODEL_NAME = "turbo"
+# HuggingFace репо с MLX-весами (fallback если нет Groq-ключа)
+MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+# Модель Groq Whisper (основной бэкенд)
+GROQ_MODEL = "whisper-large-v3-turbo"
 
 # Папки проекта (создаются автоматически рядом со скриптом)
 INPUT_DIR_NAME = "input"
@@ -140,23 +142,73 @@ def get_hf_token(base_dir: Path) -> str:
     )
 
 
-# ------------ Whisper и pyannote ------------
+def get_groq_key(base_dir: Path):
+    key = os.environ.get("GROQ_API_KEY")
+    if key:
+        return key.strip()
+    key_file = base_dir / "groq_key.txt"
+    if key_file.exists():
+        key = key_file.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    return None
 
-def run_whisper(model, audio_path: Path):
-    print(f"[whisper] Транскрибирую {audio_path.name} ...")
-    segments, info = model.transcribe(str(audio_path), beam_size=5)
-    
-    # Приводим вывод faster-whisper к формату, который ждет наш старый код (список словарей)
-    whisper_segments = []
-    for segment in segments:
-        whisper_segments.append({
-            "start": segment.start,
-            "end": segment.end,
-            "text": segment.text
-        })
-    
-    print(f"[whisper] Готово: {audio_path.name}")
-    return {"segments": whisper_segments}
+
+# ------------ Whisper и диаризация ------------
+
+def run_whisper(audio_path: Path, groq_key: str | None = None):
+    if groq_key:
+        print(f"[whisper] Транскрибирую {audio_path.name} (Groq API) ...")
+        client = Groq(api_key=groq_key)
+        with open(audio_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model=GROQ_MODEL,
+                file=(audio_path.name, f),
+                response_format="verbose_json",
+            )
+        print(f"[whisper] Готово: {audio_path.name}")
+        return {"segments": [
+            {"start": s["start"], "end": s["end"], "text": s["text"]}
+            for s in result.segments
+        ]}
+    else:
+        print(f"[whisper] Транскрибирую {audio_path.name} (MLX, GPU/Neural Engine) ...")
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=MLX_MODEL_REPO,
+            verbose=False,
+        )
+        print(f"[whisper] Готово: {audio_path.name}")
+        return result
+
+
+def run_simple_diarizer(audio_path: Path):
+    # silero-vad грузится через torch.hub и требует интерактивного подтверждения доверия;
+    # добавляем его в trusted_list заранее, чтобы не блокироваться без терминала
+    hub_dir = Path(torch.hub.get_dir())
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    trusted_file = hub_dir / "trusted_list"
+    if not trusted_file.exists() or "snakers4_silero-vad" not in trusted_file.read_text():
+        with trusted_file.open("a") as f:
+            f.write("snakers4_silero-vad\n")
+
+    from simple_diarizer.diarizer import Diarizer
+    print(f"[diarizer] Диаризация {audio_path.name} (simple-diarizer, ECAPA-TDNN) ...")
+    diarizer = Diarizer(embed_model='ecapa', cluster_method='sc')
+    segments = diarizer.diarize(str(audio_path), num_speakers=None, threshold=0.8)
+    print(f"[diarizer] Готово: {audio_path.name}")
+    return [
+        {"start": s["start"], "end": s["end"], "speaker": f"SPEAKER_{s['label']:02d}"}
+        for s in segments
+    ]
+
+
+def run_diarization(audio_path: Path, diar_pipeline=None):
+    try:
+        return run_simple_diarizer(audio_path)
+    except ImportError:
+        print("[diarizer] simple-diarizer не найден, использую pyannote")
+        return run_pyannote(diar_pipeline, audio_path)
 
 
 def run_pyannote(pipeline, audio_path: Path):
@@ -291,9 +343,10 @@ def process_file(
     file_path: Path,
     output_dir: Path,
     temp_dir: Path,
-    whisper_model,
     diar_pipeline,
     diar_model_name: str,
+    groq_key: str | None = None,
+    asr_model_name: str = "",
 ):
     """
     Обрабатывает один файл: извлечение аудио (если нужно),
@@ -306,16 +359,15 @@ def process_file(
 
     print(f"\n=== Обработка файла: {file_path.name} ===")
 
-    # 1. Подготовка/извлечение аудио
+    # 1. Конвертация в WAV 16 kHz mono
     if is_audio_file(file_path):
-        print("[stage] 1/4 Нормализация аудио в WAV 16kHz mono через ffmpeg")
-        audio_path = convert_to_mono16k_wav(file_path, temp_dir)
+        print("[stage] 1/4 Конвертация аудио → WAV 16kHz mono")
     elif is_video_file(file_path):
-        print("[stage] 1/4 Извлечение и нормализация аудио из видео через ffmpeg")
-        audio_path = convert_to_mono16k_wav(file_path, temp_dir)
+        print("[stage] 1/4 Извлечение аудио из видео → WAV 16kHz mono")
     else:
         print(f"[warn] Неизвестный тип файла, пропускаю: {file_path.name}")
         return
+    audio_path = convert_to_mono16k_wav(file_path, temp_dir)
 
     total_audio_sec = get_audio_duration(audio_path)
     if total_audio_sec > 0:
@@ -324,25 +376,26 @@ def process_file(
             f"({total_audio_sec:.1f} с)"
         )
 
-    # 2. Транскрипция Whisper
-    print("[stage] 2/4 Транскрипция (Whisper)")
-    whisper_result = run_whisper(whisper_model, audio_path)
+    # 2+3. Транскрипция и диаризация параллельно
+    print("[stage] 2+3/4 Транскрипция и диаризация параллельно")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_whisper = executor.submit(run_whisper, audio_path, groq_key)
+        future_diar = executor.submit(run_diarization, audio_path, diar_pipeline)
+        whisper_result = future_whisper.result()
+        diar_segments = future_diar.result()
+
     whisper_segments = whisper_result.get("segments", [])
     if not whisper_segments:
         print(f"[warn] Whisper не вернул сегментов для {file_path.name}")
         return
 
-    # 3. Диаризация pyannote
-    print("[stage] 3/4 Диаризация (pyannote)")
-    diar_segments = run_pyannote(diar_pipeline, audio_path)
-
-    print("[stage] 3.5/4 Назначение спикеров по таймкодам")
+    print("[stage] 3/4 Назначение спикеров по таймкодам")
     whisper_segments = assign_speakers_to_segments(whisper_segments, diar_segments)
     normalize_speaker_labels(whisper_segments)
 
     # 4. Формирование и сохранение Markdown
-    print("[stage] 4/4 Формирование и сохранение Markdown")
-    md_text = build_markdown(file_path, whisper_segments, MODEL_NAME, diar_model_name)
+    print("[stage] 4/4 Сохранение Markdown")
+    md_text = build_markdown(file_path, whisper_segments, asr_model_name or "whisper", diar_model_name)
     output_path.write_text(md_text, encoding="utf-8")
     print(f"[ok] Сохранил транскрипт: {output_path}")
 
@@ -356,26 +409,33 @@ def process_file(
 
 def main():
     base_dir, input_dir, output_dir, temp_dir = get_base_dirs()
-
-    hf_token = get_hf_token(base_dir)
-
     device = detect_device()
     print(f"[init] device: {device}")
 
-    print(f"[init] Загружаю Whisper модель '{MODEL_NAME}'...")
-    # faster-whisper использует "cpu" или "cuda" (и "auto"). Для Mac (MPS) пока лучше использовать CPU + int8,
-    # на M2 это всё равно работает в 2-4 раза быстрее старого Whisper
-    whisper_model = WhisperModel("large-v3-turbo", device="cpu", compute_type="int8") 
+    # --- Whisper бэкенд ---
+    groq_key = get_groq_key(base_dir)
+    if groq_key:
+        asr_model_name = f"groq/{GROQ_MODEL}"
+        print(f"[init] Whisper: Groq API (модель {GROQ_MODEL})")
+    else:
+        asr_model_name = f"mlx/{MLX_MODEL_REPO.split('/')[-1]}"
+        print(f"[init] Whisper: MLX '{MLX_MODEL_REPO}' (нет groq_key.txt, fallback)")
 
-    diar_model_name = "pyannote/speaker-diarization-3.1"
-    print(f"[init] Загружаю pyannote pipeline '{diar_model_name}'...")
-    diar_pipeline = Pipeline.from_pretrained(
-        diar_model_name,
-        token=hf_token,
-    )
-    diar_device = device if device == "cuda" else "cpu"
-    diar_pipeline.to(torch.device(diar_device))
-    print(f"[init] pyannote будет работать на: {diar_device}")
+    # --- Диаризация бэкенд ---
+    try:
+        from simple_diarizer.diarizer import Diarizer as _Diarizer  # noqa: F401
+        diar_pipeline = None
+        diar_model_name = "simple-diarizer/ecapa"
+        print("[init] Диаризация: simple-diarizer (ECAPA-TDNN)")
+    except ImportError:
+        print("[init] simple-diarizer не найден, загружаю pyannote...")
+        hf_token = get_hf_token(base_dir)
+        diar_model_name = "pyannote/speaker-diarization-3.1"
+        print(f"[init] Загружаю pyannote pipeline '{diar_model_name}'...")
+        diar_pipeline = Pipeline.from_pretrained(diar_model_name, token=hf_token)
+        diar_device = device if device == "cuda" else "cpu"
+        diar_pipeline.to(torch.device(diar_device))
+        print(f"[init] pyannote будет работать на: {diar_device}")
 
     files = sorted(input_dir.iterdir())
     if not files:
@@ -393,9 +453,10 @@ def main():
             path,
             output_dir=output_dir,
             temp_dir=temp_dir,
-            whisper_model=whisper_model,
             diar_pipeline=diar_pipeline,
             diar_model_name=diar_model_name,
+            groq_key=groq_key,
+            asr_model_name=asr_model_name,
         )
 
 

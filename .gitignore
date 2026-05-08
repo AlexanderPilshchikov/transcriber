@@ -4,6 +4,8 @@ groq_key.txt
 input/
 output/
 temp/
+pretrained_models/
+.claude/
 __pycache__/
 *.py[cod]
 .DS_Store

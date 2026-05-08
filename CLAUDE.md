@@ -17,7 +17,7 @@ Single-file pipeline in `transcribe_diarize.py`. Per-file processing has 4 stage
 
 1. **Audio prep** (`convert_to_mono16k_wav`) — every input file (audio or video) is converted to mono 16 kHz WAV in `temp/` via `ffmpeg`. Temp file is deleted after processing.
 2. **Transcription + Diarization in parallel** (`ThreadPoolExecutor(max_workers=2)`):
-   - `run_whisper(audio_path, groq_key)` — if `groq_key` is set, calls Groq Whisper API (network I/O, ~seconds); otherwise falls back to `mlx_whisper.transcribe()` on Metal GPU/Neural Engine. Returns `{"segments": [{"start", "end", "text"}]}`.
+   - `run_whisper(audio_path, groq_key)` — if `groq_key` is set, attempts Groq Whisper API (network I/O, ~seconds); on any API error falls back to `_run_whisper_mlx()` on Metal GPU/Neural Engine. If no key, goes directly to MLX. Returns `{"segments": [{"start", "end", "text"}]}`.
    - `run_diarization(audio_path, diar_pipeline)` — tries `run_simple_diarizer()` first (ECAPA-TDNN via speechbrain, CPU); falls back to `run_pyannote()` on `ImportError`.
 3. **Merge** (`assign_speakers_to_segments` → `normalize_speaker_labels`) — assigns speaker to each Whisper segment by midpoint lookup, falls back to max-overlap. Maps internal labels to "Спикер 1", "Спикер 2", …
 4. **Output** (`build_markdown`) — writes `output/<stem>.md`.
@@ -43,16 +43,29 @@ WAV 16 kHz mono is ~1.8 MB/min, so files longer than ~13 min trigger chunking.
 
 ## Backend selection (runtime)
 
-`main()` auto-selects backends:
+`main()` auto-selects backends. All fallbacks are automatic — no config change needed.
 
-| Backend | Condition |
-|---|---|
-| Groq API (transcription) | `groq_key.txt` exists or `GROQ_API_KEY` env var set |
-| mlx-whisper fallback | No Groq key found |
-| simple-diarizer (diarization) | `simple_diarizer` importable |
-| pyannote fallback | `ImportError` on simple_diarizer import |
+### Transcription
+
+| Priority | Backend | Condition |
+|---|---|---|
+| 1 | Groq Whisper API | `groq_key.txt` or `GROQ_API_KEY` is set AND API call succeeds |
+| 2 | mlx-whisper (local) | No key, OR Groq API throws any exception (rate limit, network, auth) |
+
+The switch to mlx-whisper on API error is handled inside `run_whisper()` via a broad `except Exception` wrapping the entire Groq block.
+
+### Diarization
+
+| Priority | Backend | Condition |
+|---|---|---|
+| 1 | simple-diarizer (ECAPA-TDNN, CPU) | `simple_diarizer` importable |
+| 2 | pyannote.audio (CPU/CUDA) | `ImportError` on simple_diarizer import |
 
 pyannote requires HuggingFace token (`hf_token.txt` or `HUGGINGFACE_TOKEN` env var). simple-diarizer does not.
+
+### Lazy imports
+
+`groq`, `mlx_whisper`, and `pyannote` are imported inside their respective functions, not at module top-level. This means the script starts successfully even if one of these packages is missing, as long as the actually-used backend is installed.
 
 ## silero-vad trust
 

@@ -17,7 +17,7 @@
 
 1. Любой входной файл конвертируется в WAV 16 kHz mono через `ffmpeg`
 2. Параллельно запускаются два процесса:
-   - **Транскрипция** — Groq Whisper API (сетевой запрос, ~секунды); fallback: mlx-whisper на GPU/Neural Engine
+   - **Транскрипция** — Groq Whisper API (~секунды); при отсутствии ключа **или любой ошибке API** автоматически переключается на mlx-whisper локально (Metal GPU/Neural Engine, ~10–15 мин для часа записи)
    - **Диаризация** — simple-diarizer ECAPA-TDNN (CPU); fallback: pyannote.audio
 3. Сегменты Whisper совмещаются с метками спикеров по таймкодам
 4. Сохраняется `output/<имя>.md`
@@ -35,13 +35,24 @@
 **Спикер 2 [00:00:11–00:00:18]:** Да, всем привет.
 ```
 
+## Режимы работы
+
+| | Онлайн (быстро) | Офлайн (локально) |
+|---|---|---|
+| **Транскрипция** | Groq Whisper API | mlx-whisper (Metal GPU) |
+| **Скорость** | ~30 сек на час записи | ~10–15 мин на час записи |
+| **Что нужно** | `groq_key.txt` с ключом | ничего дополнительно |
+| **Переключение** | автоматически, если нет ключа или API упал | — |
+
+Диаризация всегда работает локально: simple-diarizer (ECAPA-TDNN) → pyannote.audio как fallback.
+
 ## Требования
 
 - Python 3.10+
 - `ffmpeg` (должен быть доступен в `PATH`)
-- **Groq API ключ** (бесплатно, 2 ч/день): [console.groq.com](https://console.groq.com) → API Keys
+- **Groq API ключ** (опционально, бесплатно, 2 ч/день): [console.groq.com](https://console.groq.com) → API Keys
 
-HuggingFace токен нужен только если Groq недоступен и используется fallback-диаризация через pyannote.
+HuggingFace токен нужен только для fallback-диаризации через pyannote (если simple-diarizer не установлен).
 
 ## Установка
 

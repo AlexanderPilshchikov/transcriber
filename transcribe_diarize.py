@@ -14,11 +14,7 @@ import os
 import subprocess
 from pathlib import Path
 
-import mlx_whisper
 import torch
-from groq import Groq
-from pyannote.audio import Pipeline
-from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 
 # ------------ Конфигурация ------------
@@ -190,52 +186,64 @@ def _transcribe_chunk(client, chunk_path: Path, offset: float) -> list[dict]:
     ]
 
 
-def run_whisper(audio_path: Path, groq_key: str | None = None):
+def _run_whisper_mlx(audio_path: Path) -> dict:
+    """Транскрипция через mlx-whisper локально (Metal GPU / Neural Engine)."""
+    import mlx_whisper  # lazy import — не нужен если работает Groq
+    print(f"[whisper] Транскрибирую {audio_path.name} (MLX, локально) ...")
+    result = mlx_whisper.transcribe(
+        str(audio_path),
+        path_or_hf_repo=MLX_MODEL_REPO,
+        verbose=False,
+    )
+    print(f"[whisper] Готово: {audio_path.name}")
+    return result
+
+
+def run_whisper(audio_path: Path, groq_key: str | None = None) -> dict:
     if groq_key:
-        file_size = audio_path.stat().st_size
-        client = Groq(api_key=groq_key)
+        try:
+            from groq import Groq  # lazy import — не нужен если нет ключа
+            file_size = audio_path.stat().st_size
+            client = Groq(api_key=groq_key)
 
-        if file_size > GROQ_MAX_FILE_BYTES:
-            size_mb = file_size / 1024 / 1024
-            print(
-                f"[whisper] Файл {audio_path.name} ({size_mb:.0f} МБ) превышает "
-                f"лимит Groq 25 МБ, разбиваю на чанки по {GROQ_CHUNK_SEC // 60} мин ..."
-            )
-            chunks = split_audio(audio_path, GROQ_CHUNK_SEC)
-            print(f"[whisper] Чанков: {len(chunks)}")
-            all_segments = []
-            for i, chunk_path in enumerate(chunks):
-                offset = i * GROQ_CHUNK_SEC
+            if file_size > GROQ_MAX_FILE_BYTES:
+                size_mb = file_size / 1024 / 1024
                 print(
-                    f"[whisper] Чанк {i + 1}/{len(chunks)}: {chunk_path.name} "
-                    f"(смещение {format_time(offset)}) ..."
+                    f"[whisper] Файл {audio_path.name} ({size_mb:.0f} МБ) превышает "
+                    f"лимит Groq 25 МБ, разбиваю на чанки по {GROQ_CHUNK_SEC // 60} мин ..."
                 )
-                all_segments.extend(_transcribe_chunk(client, chunk_path, float(offset)))
-                chunk_path.unlink()
-            print(f"[whisper] Готово: {audio_path.name} ({len(all_segments)} сегментов)")
-            return {"segments": all_segments}
+                chunks = split_audio(audio_path, GROQ_CHUNK_SEC)
+                print(f"[whisper] Чанков: {len(chunks)}")
+                all_segments = []
+                for i, chunk_path in enumerate(chunks):
+                    offset = i * GROQ_CHUNK_SEC
+                    print(
+                        f"[whisper] Чанк {i + 1}/{len(chunks)}: {chunk_path.name} "
+                        f"(смещение {format_time(offset)}) ..."
+                    )
+                    all_segments.extend(_transcribe_chunk(client, chunk_path, float(offset)))
+                    chunk_path.unlink()
+                print(f"[whisper] Готово: {audio_path.name} ({len(all_segments)} сегментов)")
+                return {"segments": all_segments}
 
-        print(f"[whisper] Транскрибирую {audio_path.name} (Groq API) ...")
-        with open(audio_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model=GROQ_MODEL,
-                file=(audio_path.name, f),
-                response_format="verbose_json",
-            )
-        print(f"[whisper] Готово: {audio_path.name}")
-        return {"segments": [
-            {"start": s["start"], "end": s["end"], "text": s["text"]}
-            for s in result.segments
-        ]}
-    else:
-        print(f"[whisper] Транскрибирую {audio_path.name} (MLX, GPU/Neural Engine) ...")
-        result = mlx_whisper.transcribe(
-            str(audio_path),
-            path_or_hf_repo=MLX_MODEL_REPO,
-            verbose=False,
-        )
-        print(f"[whisper] Готово: {audio_path.name}")
-        return result
+            print(f"[whisper] Транскрибирую {audio_path.name} (Groq API) ...")
+            with open(audio_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    model=GROQ_MODEL,
+                    file=(audio_path.name, f),
+                    response_format="verbose_json",
+                )
+            print(f"[whisper] Готово: {audio_path.name}")
+            return {"segments": [
+                {"start": s["start"], "end": s["end"], "text": s["text"]}
+                for s in result.segments
+            ]}
+
+        except Exception as exc:
+            print(f"[whisper] Groq API недоступен: {exc}")
+            print("[whisper] Переключаюсь на MLX-Whisper (локально) ...")
+
+    return _run_whisper_mlx(audio_path)
 
 
 def run_simple_diarizer(audio_path: Path):
@@ -274,8 +282,9 @@ def run_pyannote(pipeline, audio_path: Path):
     В новых версиях pipeline(...) возвращает DiarizeOutput с полями:
     - speaker_diarization: Annotation (обычная диаризация)
     - exclusive_speaker_diarization: Annotation (без наложения)
-    Нам нужен Annotation, у которого есть .itertracks()[web:61][web:36][web:53]
+    Нам нужен Annotation, у которого есть .itertracks()
     """
+    from pyannote.audio.pipelines.utils.hook import ProgressHook  # lazy import
     print(f"[pyannote] Диаризация {audio_path.name} (0% -> 100%) ...")
     with ProgressHook() as hook:
         diarization = pipeline(str(audio_path), hook=hook)
@@ -485,6 +494,13 @@ def main():
         print("[init] Диаризация: simple-diarizer (ECAPA-TDNN)")
     except ImportError:
         print("[init] simple-diarizer не найден, загружаю pyannote...")
+        try:
+            from pyannote.audio import Pipeline  # lazy import — не нужен если есть simple-diarizer
+        except ImportError:
+            raise RuntimeError(
+                "Ни simple-diarizer, ни pyannote не установлены.\n"
+                "Установи хотя бы одно: pip install simple-diarizer  ИЛИ  pip install pyannote.audio"
+            )
         hf_token = get_hf_token(base_dir)
         diar_model_name = "pyannote/speaker-diarization-3.1"
         print(f"[init] Загружаю pyannote pipeline '{diar_model_name}'...")
